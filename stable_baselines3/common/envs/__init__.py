@@ -1,3 +1,5 @@
+import gymnasium as gym
+
 from stable_baselines3.common.envs.bit_flipping_env import BitFlippingEnv
 from stable_baselines3.common.envs.identity_env import (
     FakeImageEnv,
@@ -6,9 +8,17 @@ from stable_baselines3.common.envs.identity_env import (
     IdentityEnvMultiBinary,
     IdentityEnvMultiDiscrete,
 )
+from stable_baselines3.common.envs.causal_tracking import CausalTrackingEnv
 from stable_baselines3.common.envs.multi_input_envs import SimpleMultiObsEnv
 
+gym.register(
+    id="CausalTracking-v0",
+    entry_point="stable_baselines3.common.envs.causal_tracking:CausalTrackingEnv",
+    max_episode_steps=500,
+)
+
 __all__ = [
+    "CausalTrackingEnv",
     "BitFlippingEnv",
     "FakeImageEnv",
     "IdentityEnv",
