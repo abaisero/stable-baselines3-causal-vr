@@ -24,10 +24,8 @@ from stable_baselines3.common.causal_env import CausalEnv
 #
 # Action (discrete, len(ACTIONS) choices):
 #   0: move x left  (-1.0)
-#   1: move x left  (-0.5)
-#   2: stay         ( 0.0)
-#   3: move x right (+0.5)
-#   4: move x right (+1.0)
+#   1: stay         ( 0.0)
+#   2: move x right (+1.0)
 #
 # Dynamics:
 #   x' = x + ACTIONS[a] + noise_x,   noise_x ~ N(0, sigma_x)
@@ -43,7 +41,7 @@ from stable_baselines3.common.causal_env import CausalEnv
 N_OBS = 2
 
 # Maps discrete action index to displacement applied to x
-ACTIONS = np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32)
+ACTIONS = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
 
 
 class CausalTrackingEnv(CausalEnv):
@@ -84,12 +82,15 @@ class CausalTrackingEnv(CausalEnv):
     def step(self, action: int):
         action_state = np.array([ACTIONS[action], 0.0], dtype=np.float32)
         # action_state.shape == (N_OBS,)
+        self._state = self._state + action_state
+        # self._state.shape == (N_OBS,)
+        reward = float(-abs(self._state[0] - self._state[1]))
+
         noise = self.np_random.normal([0.0, 0.0], [self.sigma_x, self.sigma_y]).astype(np.float32)
         # noise.shape == (N_OBS,)
-        self._state = self._state + action_state + noise
+        self._state = self._state + noise
         # self._state.shape == (N_OBS,)
 
-        reward = float(-abs(self._state[0] - self._state[1]))
         return self._state.copy(), reward, False, False, {}
 
     def adjacency_as(self) -> np.ndarray:
