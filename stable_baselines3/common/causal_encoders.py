@@ -6,7 +6,7 @@ from torch import nn
 from stable_baselines3.common.causal_utils import CausalMaskManager
 
 
-class FutureEncoder(nn.Module, ABC):
+class FutureModel(nn.Module, ABC):
     """
     Base class for modules that encode a future observation sequence into a
     fixed-size representation.
@@ -23,9 +23,9 @@ class FutureEncoder(nn.Module, ABC):
         self.output_dim = output_dim
 
     @abstractmethod
-    def forward(self, obs: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
+    def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
         """
-        :param obs: Anchor observation. shape == (B, O)
+        :param observation: Anchor observation. shape == (B, O)
         :param future_observations: shape == (B, K, O)
         :param future_mask: Temporal validity mask — True where future_observations contains a real
             timestep, False where it is padding. This is unrelated to causal masking; causal feature
@@ -34,7 +34,7 @@ class FutureEncoder(nn.Module, ABC):
         """
 
 
-class MeanFutureEncoder(FutureEncoder):
+class MeanFutureModel(FutureModel):
     """
     Encodes future observations by mean-pooling valid timesteps after zeroing
     out action-descendant features via the causal non-descendant mask, then
@@ -49,8 +49,8 @@ class MeanFutureEncoder(FutureEncoder):
         super().__init__(mask_manager, obs_dim, output_dim)
         self.projection = nn.Sequential(nn.Linear(obs_dim, output_dim), nn.ReLU())
 
-    def forward(self, obs: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
-        # obs.shape == (B, O)
+    def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
+        # observation.shape == (B, O)
         # future_observations.shape == (B, K, O)
         # future_mask: boolean mask indicating which timesteps are real (not padding).
         #   True = valid timestep, False = padded. Has nothing to do with causal masking.
@@ -77,7 +77,7 @@ class MeanFutureEncoder(FutureEncoder):
         return future_enc
 
 
-class AttentionFutureEncoder(FutureEncoder):
+class AttentionFutureModel(FutureModel):
     """
     Encodes future observations using multi-head self-attention over valid timesteps.
 
@@ -106,7 +106,7 @@ class AttentionFutureEncoder(FutureEncoder):
         dropout: float = 0.0,
     ):
         super().__init__(mask_manager, obs_dim, output_dim)
-        self.input_proj = nn.Linear(obs_dim, output_dim)
+        self.projection = nn.Linear(obs_dim, output_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=output_dim,
             nhead=n_heads,
@@ -116,8 +116,8 @@ class AttentionFutureEncoder(FutureEncoder):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-    def forward(self, obs: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
-        # obs.shape == (B, O)
+    def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
+        # observation.shape == (B, O)
         # future_observations.shape == (B, K, O)
         # future_mask.shape == (B, K)
         B, K, _ = future_observations.shape
@@ -135,7 +135,7 @@ class AttentionFutureEncoder(FutureEncoder):
         masked_obs = future_observations * non_descendant_mask.unsqueeze(0)
         # masked_obs.shape == (B, K, O)
 
-        x = self.input_proj(masked_obs)
+        x = self.projection(masked_obs)
         # x.shape == (B, K, F)
 
         # PyTorch's src_key_padding_mask: True = position to be ignored (padding).
@@ -153,20 +153,125 @@ class AttentionFutureEncoder(FutureEncoder):
         return future_enc
 
 
-class CrossAttentionFutureEncoder(FutureEncoder):
+class EncoderDecoderFutureModel(FutureModel):
     """
-    Encodes future observations via cross-attention, using ``obs`` as the query
-    and causally-masked ``future_observations`` as keys and values.
+    Encodes future observations using a full encoder-decoder transformer.
 
-    The anchor observation attends to the future sequence directly, producing a
-    single output vector with no pooling required.  Multiple layers refine the
-    query against the same fixed future memory.
+    Future observations (with action-descendant features zeroed out) are first
+    processed by a self-attention encoder so timesteps can exchange information.
+    The anchor ``observation`` is then projected to a single query token and
+    cross-attends to the encoded future tokens via a transformer decoder.
+    The single output token is returned as the fixed-size representation.
+
+    Compared to ``CrossAttentionFutureModel``, this variant lets future timesteps
+    interact with each other before the anchor queries them.
 
     :param mask_manager: Provides the non-descendant mask for causal feature masking.
     :param obs_dim: Dimensionality of each observation.
-    :param output_dim: Dimensionality of the output representation (= attention embed_dim).
+    :param output_dim: Dimensionality of the output representation (= ``d_model``).
     :param n_heads: Number of attention heads.
-    :param n_layers: Number of cross-attention layers.
+    :param n_encoder_layers: Number of self-attention encoder layers over futures.
+    :param n_decoder_layers: Number of cross-attention decoder layers.
+    :param dim_feedforward: Inner dimension of the feed-forward sublayer.
+    :param dropout: Dropout probability inside transformer layers.
+    """
+
+    def __init__(
+        self,
+        mask_manager: CausalMaskManager,
+        obs_dim: int,
+        output_dim: int,
+        *,
+        n_heads: int = 4,
+        n_encoder_layers: int = 2,
+        n_decoder_layers: int = 1,
+        dim_feedforward: int = 256,
+        dropout: float = 0.0,
+    ):
+        super().__init__(mask_manager, obs_dim, output_dim)
+        self.observation_projection = nn.Linear(obs_dim, output_dim)
+        self.future_projection = nn.Linear(obs_dim, output_dim)
+        # Learned per-feature sentinel substituted in place of action-descendant features,
+        # so the network can distinguish "causally masked" from a genuine value of 0.
+        self.mask_value = nn.Parameter(th.empty(obs_dim))
+        nn.init.normal_(self.mask_value, std=0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=output_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_encoder_layers)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=output_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_decoder_layers)
+
+    def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
+        # observation.shape == (B, O)
+        # future_observations.shape == (B, K, O)
+        # future_mask.shape == (B, K)
+        B, K, _ = future_observations.shape
+        F = self.output_dim
+
+        if K == 0:
+            return th.zeros(B, F, device=observation.device)
+            # return shape == (B, F)
+
+        non_descendant_mask = self.mask_manager.non_descendant_mask(K)
+        # non_descendant_mask.shape == (K, O)
+        non_descendant_mask = th.as_tensor(non_descendant_mask, dtype=th.float32, device=future_observations.device)
+        # non_descendant_mask.shape == (K, O)
+
+        nd_mask = non_descendant_mask.unsqueeze(0)
+        # nd_mask.shape == (1, K, O)
+        masked_future = future_observations * nd_mask + self.mask_value * (1.0 - nd_mask)
+        # masked_future.shape == (B, K, O)
+
+        kv_tokens = self.future_projection(masked_future)
+        # kv_tokens.shape == (B, K, F)
+
+        # PyTorch's key_padding_mask convention: True = position to be ignored.
+        future_padding_mask = ~future_mask
+        # future_padding_mask.shape == (B, K)
+
+        future_tokens = self.encoder(kv_tokens, src_key_padding_mask=future_padding_mask)
+        # future_tokens.shape == (B, K, F)
+
+        query_tokens = self.observation_projection(observation).unsqueeze(1)
+        # query_tokens.shape == (B, 1, F)
+
+        output = self.decoder(query_tokens, future_tokens, memory_key_padding_mask=future_padding_mask)
+        # output.shape == (B, 1, F)
+        output = output.squeeze(1)
+        # output.shape == (B, F)
+
+        return output
+
+
+class CrossAttentionFutureModel(FutureModel):
+    """
+    Encodes future observations via cross-attention, using ``observation`` as the query
+    and causally-masked ``future_observations`` as keys and values.
+
+    Built on a stack of ``nn.TransformerDecoderLayer`` modules: each layer applies
+    self-attention on the (single-token) query, cross-attention to the future
+    memory, and a feed-forward sublayer, with residual + layer-norm around each.
+    The self-attention on a single-token query is functionally inert but comes
+    for free with the standard primitive.
+
+    :param mask_manager: Provides the non-descendant mask for causal feature masking.
+    :param obs_dim: Dimensionality of each observation.
+    :param output_dim: Dimensionality of the output representation (= ``d_model``).
+    :param n_heads: Number of attention heads.
+    :param n_layers: Number of decoder layers.
+    :param dim_feedforward: Inner dimension of the feed-forward sublayer.
+    :param dropout: Dropout probability inside decoder layers.
     """
 
     def __init__(
@@ -177,23 +282,30 @@ class CrossAttentionFutureEncoder(FutureEncoder):
         *,
         n_heads: int = 4,
         n_layers: int = 1,
+        dim_feedforward: int = 256,
+        dropout: float = 0.0,
     ):
         super().__init__(mask_manager, obs_dim, output_dim)
-        self.obs_proj = nn.Linear(obs_dim, output_dim)
-        self.attn_layers = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=output_dim, num_heads=n_heads, kdim=obs_dim, vdim=obs_dim, batch_first=True)
-            for _ in range(n_layers)
-        ])
+        self.observation_projection = nn.Linear(obs_dim, output_dim)
+        self.future_projection = nn.Linear(obs_dim, output_dim)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=output_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
 
-    def forward(self, obs: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
-        # obs.shape == (B, O)
+    def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
+        # observation.shape == (B, O)
         # future_observations.shape == (B, K, O)
         # future_mask.shape == (B, K)
         B, K, _ = future_observations.shape
         F = self.output_dim
 
         if K == 0:
-            return th.zeros(B, F, device=obs.device)
+            return th.zeros(B, F, device=observation.device)
             # return shape == (B, F)
 
         non_descendant_mask = self.mask_manager.non_descendant_mask(K)
@@ -201,20 +313,24 @@ class CrossAttentionFutureEncoder(FutureEncoder):
         non_descendant_mask = th.as_tensor(non_descendant_mask, dtype=th.float32, device=future_observations.device)
         # non_descendant_mask.shape == (K, O)
 
-        kv = future_observations * non_descendant_mask.unsqueeze(0)
-        # kv.shape == (B, K, O)
+        masked_future = future_observations * non_descendant_mask.unsqueeze(0)
+        # masked_future.shape == (B, K, O)
 
-        # PyTorch's key_padding_mask: True = position to be ignored (padding).
-        key_padding_mask = ~future_mask
-        # key_padding_mask.shape == (B, K)
+        kv_tokens = self.future_projection(masked_future)
+        # kv_tokens.shape == (B, K, F)
 
-        query = self.obs_proj(obs).unsqueeze(1)
-        # query.shape == (B, 1, F)
+        query_tokens = self.observation_projection(observation).unsqueeze(1)
+        # query_tokens.shape == (B, 1, F)
 
-        for attn in self.attn_layers:
-            query, _ = attn(query, kv, kv, key_padding_mask=key_padding_mask)
-            # query.shape == (B, 1, F)
+        # ``memory_key_padding_mask`` is PyTorch's name for the cross-attn padding mask;
+        # True = position to be ignored. Here ``kv_tokens`` plays the role of the
+        # decoder's "memory".
+        future_padding_mask = ~future_mask
+        # future_padding_mask.shape == (B, K)
 
-        future_enc = query.squeeze(1)
+        out = self.decoder(query_tokens, kv_tokens, memory_key_padding_mask=future_padding_mask)
+        # out.shape == (B, 1, F)
+
+        future_enc = out.squeeze(1)
         # future_enc.shape == (B, F)
         return future_enc

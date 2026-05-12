@@ -1,7 +1,8 @@
 import torch as th
 from torch import nn
 
-from stable_baselines3.common.causal_encoders import MeanFutureEncoder
+from stable_baselines3.common.causal_encoders import MeanFutureModel
+from stable_baselines3.common.causal_encoders import EncoderDecoderFutureModel
 from stable_baselines3.common.causal_utils import CausalMaskManager
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import create_mlp
@@ -30,10 +31,10 @@ class CausalActorCriticPolicy(ActorCriticPolicy):
 
     def _build_causal_critic(self) -> None:
         O = self.observation_space.shape[0]  # type: ignore[index]
-        F = O
+        F = 64
         # TODO: this is a placeholder architecture. Replace with the intended design
         #       (e.g. sequential model over future observations) once the pipeline is validated.
-        self.future_encoder = MeanFutureEncoder(self.mask_manager, obs_dim=O, output_dim=F)
+        self.future_encoder = EncoderDecoderFutureModel(self.mask_manager, obs_dim=O, output_dim=F)
         modules = create_mlp(input_dim=O + F, output_dim=1, net_arch=[64, 64])
         self.causal_value_net = nn.Sequential(*modules)
 
