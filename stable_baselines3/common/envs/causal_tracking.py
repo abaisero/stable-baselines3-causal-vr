@@ -31,8 +31,9 @@ from stable_baselines3.common.causal_env import CausalEnv
 #   x' = x + ACTIONS[a] + noise_x,   noise_x ~ N(0, sigma_x)
 #   y' = y                    + noise_y,   noise_y ~ N(0, sigma_y)
 #
-# Reward:
-#   r = -|x' - y'|   [track y with x]
+# Reward (depends on `reward_type`):
+#   "state-action": r = -|x_post_action - y|   [function of (s, a) only]
+#   "transition":   r = -|x' - y'|             [function of (s, a, s'); noise leaks in]
 #
 # Causal structure:
 #   adjacency_as:  action -> x only  (action does not affect y)
@@ -56,6 +57,8 @@ class CausalTrackingEnv(CausalEnv):
 
     :param sigma_x: std of process noise for x
     :param sigma_y: std of process noise for y (drives the tracking difficulty)
+    :param reward_type: "state-action" for R(s, a) — reward computed before noise.
+        "transition" for R(s, a, s') — reward computed after noise (next-state-dependent).
     """
 
     metadata = {"render_modes": []}
@@ -64,9 +67,15 @@ class CausalTrackingEnv(CausalEnv):
         self,
         sigma_x: float = 0.1,
         sigma_y: float = 1.0,
+        *,
+        reward_type: str = "transition",
     ):
+        if reward_type not in ("state-action", "transition"):
+            raise ValueError(f"reward_type must be 'state-action' or 'transition', got {reward_type!r}")
+
         self.sigma_x = sigma_x
         self.sigma_y = sigma_y
+        self.reward_type = reward_type
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(N_OBS,), dtype=np.float32)
         self.action_space = spaces.Discrete(len(ACTIONS))
@@ -84,12 +93,17 @@ class CausalTrackingEnv(CausalEnv):
         # action_state.shape == (N_OBS,)
         self._state = self._state + action_state
         # self._state.shape == (N_OBS,)
-        reward = float(-abs(self._state[0] - self._state[1]))
+
+        if self.reward_type == "state-action":
+            reward = float(-abs(self._state[0] - self._state[1]))
 
         noise = self.np_random.normal([0.0, 0.0], [self.sigma_x, self.sigma_y]).astype(np.float32)
         # noise.shape == (N_OBS,)
         self._state = self._state + noise
         # self._state.shape == (N_OBS,)
+
+        if self.reward_type == "transition":
+            reward = float(-abs(self._state[0] - self._state[1]))
 
         return self._state.copy(), reward, False, False, {}
 

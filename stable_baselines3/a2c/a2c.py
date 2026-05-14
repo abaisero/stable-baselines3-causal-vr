@@ -189,6 +189,12 @@ class A2C(OnPolicyAlgorithm):
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
+        perplexity = th.exp(entropy) if entropy is not None else th.exp(-log_prob)
+        # perplexity.shape == (batch,)
+        self.logger.record("diagnostics/perplexity", perplexity.mean().item())
+        self.logger.record("diagnostics/value_mean", values.mean().item())
+        self.logger.record("diagnostics/return_mean", rollout_data.returns.mean().item())
+
     def learn(
         self: SelfA2C,
         total_timesteps: int,

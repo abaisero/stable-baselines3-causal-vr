@@ -10,10 +10,8 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 
 N_ENVS = 4
 N_STEPS = 256
-# N_STEPS = 8
 TOTAL_TIMESTEPS = 10_000_000
 
-VERBOSE = 0
 VERBOSE = 1
 
 
@@ -21,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("experiment", type=str)
     parser.add_argument("seed", type=int)
+    parser.add_argument("--ent-coef", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -33,8 +32,10 @@ def main():
     experiment = args.experiment
     seed = args.seed
 
-    wandb_name = f"{env}:{algo}:{experiment}:{seed}"
-    wandb_group = f"{env}:{algo}:{experiment}"
+    hp_str = f"ec{args.ent_coef}"
+    wandb_group = f"{env}:{algo}:{experiment}:{hp_str}"
+    wandb_name = f"{wandb_group}:s{seed}"
+    wandb_tags = [f"env={env}", f"algo={algo}", f"sweep={experiment}"]
     wandb_mode = "disabled" if args.dry_run else "online"
 
     config = {
@@ -45,12 +46,14 @@ def main():
         "algo": algo,
         "experiment": experiment,
         "seed": seed,
+        "ent_coef": args.ent_coef,
     }
 
     with wandb.init(
         name=wandb_name,
         group=wandb_group,
         config=config,
+        tags=wandb_tags,
         sync_tensorboard=True,
         save_code=True,
         mode=wandb_mode,
@@ -61,6 +64,7 @@ def main():
             ActorCriticPolicy,
             venv,
             n_steps=N_STEPS,
+            ent_coef=args.ent_coef,
             verbose=VERBOSE,
             seed=seed,
             tensorboard_log=f"runs/{run.id}",

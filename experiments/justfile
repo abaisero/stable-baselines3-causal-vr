@@ -1,0 +1,39 @@
+set shell := ["bash", "-uc"]
+
+local := "/home/abaisero/git/stable-baselines3-causal-vr/"
+remote_host := "ava"
+remote_path := "/home/abaisero/experiments/stable-baselines3-causal-vr/"
+
+rsync_flags := "-avz \
+    --exclude='.git' \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    --exclude='runs' \
+    --exclude='wandb' \
+    --exclude='.mypy_cache' \
+    --exclude='.ruff_cache' \
+    --exclude='.pytest_cache' \
+    --exclude='*.egg-info'"
+
+default:
+    @just --list
+
+# Push local -> remote. Adds new files, updates modified ones. Does not delete remote-only files.
+push:
+    rsync {{rsync_flags}} \
+        {{local}} {{remote_host}}:{{remote_path}}
+
+# Preview what `push` would change on the remote, without writing anything.
+push-dry:
+    rsync {{rsync_flags}} --dry-run --itemize-changes \
+        {{local}} {{remote_host}}:{{remote_path}}
+
+# # Push local -> remote and DELETE anything on remote that is not present locally. Destructive.
+# push-mirror:
+#     rsync {{rsync_flags}} --delete \
+#         {{local}} {{remote_host}}:{{remote_path}}
+#
+# # Preview what `push-mirror` would change + delete, without writing anything.
+# push-mirror-dry:
+#     rsync {{rsync_flags}} --delete --dry-run --itemize-changes \
+#         {{local}} {{remote_host}}:{{remote_path}}

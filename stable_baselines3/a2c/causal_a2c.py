@@ -160,3 +160,11 @@ class CausalA2C(A2C):
         self.logger.record("train/causal_explained_variance", causal_explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+        perplexity = th.exp(entropy) if entropy is not None else th.exp(-log_prob)
+        # perplexity.shape == (batch,)
+        self.logger.record("diagnostics/perplexity", perplexity.mean().item())
+        self.logger.record("diagnostics/value_mean", values.mean().item())
+        self.logger.record("diagnostics/return_mean", rollout_data.returns.mean().item())
+        self.logger.record("diagnostics/causal_value_mean", causal_values.mean().item())
+        self.logger.record("diagnostics/causal_return_mean", rollout_data.causal_returns.mean().item())
