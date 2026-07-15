@@ -4,6 +4,7 @@ import torch as th
 from torch import nn
 
 from stable_baselines3.common.causal_utils import CausalMaskManager
+from stable_baselines3.common.torch_layers import create_mlp
 
 
 class FutureModel(nn.Module, ABC):
@@ -14,13 +15,45 @@ class FutureModel(nn.Module, ABC):
     :param mask_manager: Provides the non-descendant mask for causal feature masking.
     :param obs_dim: Dimensionality of each observation.
     :param output_dim: Dimensionality of the encoded future representation.
+    :param horizon: If set, only the first ``horizon`` future timesteps (nearest-first)
+        are used; the remainder is discarded before encoding. ``None`` uses the entire future.
     """
 
-    def __init__(self, mask_manager: CausalMaskManager, obs_dim: int, output_dim: int):
+    def __init__(
+        self,
+        mask_manager: CausalMaskManager,
+        obs_dim: int,
+        output_dim: int,
+        *,
+        horizon: int | None = None,
+    ):
         super().__init__()
         self.mask_manager = mask_manager
         self.obs_dim = obs_dim
         self.output_dim = output_dim
+        self.horizon = horizon
+
+    def _truncate(self, future_observations: th.Tensor, future_mask: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        """
+        Restrict the future window to the first ``horizon`` timesteps (nearest-first).
+
+        Future timesteps are ordered immediate-next-first, so slicing the leading
+        ``horizon`` columns keeps the nearest future and drops the rest. A ``horizon``
+        of ``None`` returns the inputs unchanged.
+
+        :param future_observations: shape == (B, K, O)
+        :param future_mask: shape == (B, K)
+        :returns: Truncated ``(future_observations, future_mask)`` with K' = min(K, horizon).
+        """
+        # future_observations.shape == (B, K, O)
+        # future_mask.shape == (B, K)
+        if self.horizon is None:
+            return future_observations, future_mask
+        future_observations = future_observations[:, : self.horizon]
+        # future_observations.shape == (B, K', O)  where K' = min(K, horizon)
+        future_mask = future_mask[:, : self.horizon]
+        # future_mask.shape == (B, K')
+        return future_observations, future_mask
 
     @abstractmethod
     def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
@@ -43,10 +76,18 @@ class MeanFutureModel(FutureModel):
     :param mask_manager: Provides the non-descendant mask for causal feature masking.
     :param obs_dim: Dimensionality of each observation.
     :param output_dim: Dimensionality of the encoded future representation.
+    :param horizon: If set, only the first ``horizon`` future timesteps are used.
     """
 
-    def __init__(self, mask_manager: CausalMaskManager, obs_dim: int, output_dim: int):
-        super().__init__(mask_manager, obs_dim, output_dim)
+    def __init__(
+        self,
+        mask_manager: CausalMaskManager,
+        obs_dim: int,
+        output_dim: int,
+        *,
+        horizon: int | None = None,
+    ):
+        super().__init__(mask_manager, obs_dim, output_dim, horizon=horizon)
         self.projection = nn.Sequential(nn.Linear(obs_dim, output_dim), nn.ReLU())
 
     def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
@@ -54,6 +95,9 @@ class MeanFutureModel(FutureModel):
         # future_observations.shape == (B, K, O)
         # future_mask: boolean mask indicating which timesteps are real (not padding).
         #   True = valid timestep, False = padded. Has nothing to do with causal masking.
+        # future_mask.shape == (B, K)
+        future_observations, future_mask = self._truncate(future_observations, future_mask)
+        # future_observations.shape == (B, K, O)  where K is now min(K, horizon)
         # future_mask.shape == (B, K)
         B, K, _ = future_observations.shape
         F = self.output_dim
@@ -92,6 +136,7 @@ class AttentionFutureModel(FutureModel):
     :param n_layers: Number of Transformer encoder layers.
     :param dim_feedforward: Inner dimension of the Transformer feed-forward sublayer.
     :param dropout: Dropout probability inside Transformer layers.
+    :param horizon: If set, only the first ``horizon`` future timesteps are used.
     """
 
     def __init__(
@@ -104,8 +149,9 @@ class AttentionFutureModel(FutureModel):
         n_layers: int = 2,
         dim_feedforward: int = 256,
         dropout: float = 0.0,
+        horizon: int | None = None,
     ):
-        super().__init__(mask_manager, obs_dim, output_dim)
+        super().__init__(mask_manager, obs_dim, output_dim, horizon=horizon)
         self.projection = nn.Linear(obs_dim, output_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=output_dim,
@@ -119,6 +165,9 @@ class AttentionFutureModel(FutureModel):
     def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
         # observation.shape == (B, O)
         # future_observations.shape == (B, K, O)
+        # future_mask.shape == (B, K)
+        future_observations, future_mask = self._truncate(future_observations, future_mask)
+        # future_observations.shape == (B, K, O)  where K is now min(K, horizon)
         # future_mask.shape == (B, K)
         B, K, _ = future_observations.shape
         F = self.output_dim
@@ -174,6 +223,7 @@ class EncoderDecoderFutureModel(FutureModel):
     :param n_decoder_layers: Number of cross-attention decoder layers.
     :param dim_feedforward: Inner dimension of the feed-forward sublayer.
     :param dropout: Dropout probability inside transformer layers.
+    :param horizon: If set, only the first ``horizon`` future timesteps are used.
     """
 
     def __init__(
@@ -187,8 +237,9 @@ class EncoderDecoderFutureModel(FutureModel):
         n_decoder_layers: int = 1,
         dim_feedforward: int = 256,
         dropout: float = 0.0,
+        horizon: int | None = None,
     ):
-        super().__init__(mask_manager, obs_dim, output_dim)
+        super().__init__(mask_manager, obs_dim, output_dim, horizon=horizon)
         self.observation_projection = nn.Linear(obs_dim, output_dim)
         self.future_projection = nn.Linear(obs_dim, output_dim)
         # Learned per-feature sentinel substituted in place of action-descendant features,
@@ -215,6 +266,9 @@ class EncoderDecoderFutureModel(FutureModel):
     def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
         # observation.shape == (B, O)
         # future_observations.shape == (B, K, O)
+        # future_mask.shape == (B, K)
+        future_observations, future_mask = self._truncate(future_observations, future_mask)
+        # future_observations.shape == (B, K, O)  where K is now min(K, horizon)
         # future_mask.shape == (B, K)
         B, K, _ = future_observations.shape
         F = self.output_dim
@@ -272,6 +326,7 @@ class CrossAttentionFutureModel(FutureModel):
     :param n_layers: Number of decoder layers.
     :param dim_feedforward: Inner dimension of the feed-forward sublayer.
     :param dropout: Dropout probability inside decoder layers.
+    :param horizon: If set, only the first ``horizon`` future timesteps are used.
     """
 
     def __init__(
@@ -284,8 +339,9 @@ class CrossAttentionFutureModel(FutureModel):
         n_layers: int = 1,
         dim_feedforward: int = 256,
         dropout: float = 0.0,
+        horizon: int | None = None,
     ):
-        super().__init__(mask_manager, obs_dim, output_dim)
+        super().__init__(mask_manager, obs_dim, output_dim, horizon=horizon)
         self.observation_projection = nn.Linear(obs_dim, output_dim)
         self.future_projection = nn.Linear(obs_dim, output_dim)
         decoder_layer = nn.TransformerDecoderLayer(
@@ -300,6 +356,9 @@ class CrossAttentionFutureModel(FutureModel):
     def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
         # observation.shape == (B, O)
         # future_observations.shape == (B, K, O)
+        # future_mask.shape == (B, K)
+        future_observations, future_mask = self._truncate(future_observations, future_mask)
+        # future_observations.shape == (B, K, O)  where K is now min(K, horizon)
         # future_mask.shape == (B, K)
         B, K, _ = future_observations.shape
         F = self.output_dim
@@ -332,5 +391,87 @@ class CrossAttentionFutureModel(FutureModel):
         # out.shape == (B, 1, F)
 
         future_enc = out.squeeze(1)
+        # future_enc.shape == (B, F)
+        return future_enc
+
+
+class MLPFutureModel(FutureModel):
+    """
+    Encodes a fixed-horizon future window with a plain MLP.
+
+    Unlike the attention-based variants, this model requires a fixed ``horizon`` so the
+    future window has a constant size and can be flattened into a single vector. The
+    first ``horizon`` future observations (nearest-first) have their action-descendant
+    features zeroed via the causal non-descendant mask; padded timesteps (when the real
+    future is shorter than ``horizon``, near episode ends) are zeroed via ``future_mask``.
+    The anchor ``observation`` is concatenated to the flattened window so the MLP can
+    condition on the current state, mirroring how the attention variants use it as a query.
+
+    :param mask_manager: Provides the non-descendant mask for causal feature masking.
+    :param obs_dim: Dimensionality of each observation.
+    :param output_dim: Dimensionality of the encoded future representation.
+    :param horizon: Number of future timesteps to encode. Required (unlike the base class).
+    :param net_arch: Hidden layer sizes of the MLP.
+    :param activation_fn: Activation function used between layers.
+    """
+
+    def __init__(
+        self,
+        mask_manager: CausalMaskManager,
+        obs_dim: int,
+        output_dim: int,
+        *,
+        horizon: int,
+        net_arch: list[int] | None = None,
+        activation_fn: type[nn.Module] = nn.ReLU,
+    ):
+        super().__init__(mask_manager, obs_dim, output_dim, horizon=horizon)
+        if net_arch is None:
+            net_arch = [256, 256]
+        # Input is the anchor observation concatenated with the flattened horizon window.
+        input_dim = obs_dim + horizon * obs_dim
+        self.mlp = nn.Sequential(*create_mlp(input_dim, output_dim, net_arch, activation_fn))
+
+    def forward(self, observation: th.Tensor, future_observations: th.Tensor, future_mask: th.Tensor) -> th.Tensor:
+        # observation.shape == (B, O)
+        # future_observations.shape == (B, K, O)
+        # future_mask.shape == (B, K)
+        assert self.horizon is not None
+        H = self.horizon
+        B, _, O = future_observations.shape
+
+        future_observations, future_mask = self._truncate(future_observations, future_mask)
+        # future_observations.shape == (B, K', O)  where K' = min(K, horizon)
+        # future_mask.shape == (B, K')
+        K = future_observations.shape[1]
+
+        if K < H:
+            # Pad up to exactly ``horizon`` timesteps so the flattened input has fixed width.
+            pad_obs = th.zeros(B, H - K, O, dtype=future_observations.dtype, device=future_observations.device)
+            # pad_obs.shape == (B, H - K, O)
+            future_observations = th.cat([future_observations, pad_obs], dim=1)
+            # future_observations.shape == (B, H, O)
+            pad_mask = th.zeros(B, H - K, dtype=th.bool, device=future_mask.device)
+            # pad_mask.shape == (B, H - K)
+            future_mask = th.cat([future_mask, pad_mask], dim=1)
+            # future_mask.shape == (B, H)
+
+        non_descendant_mask = self.mask_manager.non_descendant_mask(H)
+        # non_descendant_mask.shape == (H, O)
+        non_descendant_mask = th.as_tensor(non_descendant_mask, dtype=th.float32, device=future_observations.device)
+        # non_descendant_mask.shape == (H, O)
+
+        mask = non_descendant_mask.unsqueeze(0) * future_mask.float().unsqueeze(-1)
+        # mask.shape == (B, H, O)  -- combines causal feature masking and temporal padding
+        masked_future = future_observations * mask
+        # masked_future.shape == (B, H, O)
+
+        flat_future = masked_future.reshape(B, H * O)
+        # flat_future.shape == (B, H * O)
+
+        mlp_input = th.cat([observation, flat_future], dim=1)
+        # mlp_input.shape == (B, O + H * O)
+
+        future_enc = self.mlp(mlp_input)
         # future_enc.shape == (B, F)
         return future_enc

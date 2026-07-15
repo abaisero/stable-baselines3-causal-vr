@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(/home/abaisero/venvs/causal-vr/bin/python *)"
+    ]
+  }
+}

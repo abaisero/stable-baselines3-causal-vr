@@ -1,5 +1,6 @@
 import torch as th
 from gymnasium import spaces
+from scipy.stats import pearsonr
 from torch.nn import functional as F
 
 from stable_baselines3.a2c.a2c import A2C
@@ -7,6 +8,7 @@ from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.causal_buffers import FutureRolloutBuffer, FutureRolloutBufferSamples
 from stable_baselines3.common.causal_policies import CausalActorCriticPolicy
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.grad_diagnostics import policy_gradient_variance
 from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.common.vec_env import VecEnv
 
@@ -23,7 +25,14 @@ class CausalA2C(A2C):
     is provided it must be :class:`FutureRolloutBuffer` or a subclass thereof.
     """
 
-    def __init__(self, *args, causal_vf_coef: float = 1.0, rollout_buffer_class: type[RolloutBuffer] | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        causal_vf_coef: float = 1.0,
+        causal_max_grad_norm: float | None = None,
+        rollout_buffer_class: type[RolloutBuffer] | None = None,
+        **kwargs,
+    ):
         if rollout_buffer_class is None:
             rollout_buffer_class = FutureRolloutBuffer
         assert issubclass(rollout_buffer_class, FutureRolloutBuffer), (
@@ -31,6 +40,8 @@ class CausalA2C(A2C):
         )
         super().__init__(*args, rollout_buffer_class=rollout_buffer_class, **kwargs)
         self.causal_vf_coef = causal_vf_coef
+        # Clip threshold for the causal critic's dedicated optimizer; defaults to the policy's.
+        self.causal_max_grad_norm = causal_max_grad_norm if causal_max_grad_norm is not None else self.max_grad_norm
 
     def collect_rollouts(self, env: VecEnv, callback: BaseCallback, rollout_buffer: RolloutBuffer, n_rollout_steps: int) -> bool:
         """
@@ -100,9 +111,10 @@ class CausalA2C(A2C):
 
     def train(self) -> None:
         assert isinstance(self.rollout_buffer, FutureRolloutBuffer)
+        assert isinstance(self.policy, CausalActorCriticPolicy)
 
         self.policy.set_training_mode(True)
-        self._update_learning_rate(self.policy.optimizer)
+        self._update_learning_rate([self.policy.optimizer, self.policy.causal_optimizer])
 
         # This will only loop once (get all data in one go)
         for rollout_data in self.rollout_buffer.get(batch_size=None):
@@ -131,6 +143,10 @@ class CausalA2C(A2C):
 
             policy_loss = -(advantages * log_prob).mean()
 
+            # Variance of the per-sample policy gradients, measured at the pre-step parameters.
+            grad_variance = policy_gradient_variance(self.policy, rollout_data.observations, actions, advantages)
+            batch_size = advantages.shape[0]
+
             value_loss = F.mse_loss(rollout_data.returns, values)
 
             causal_value_loss = F.mse_loss(rollout_data.causal_returns, causal_values)
@@ -143,9 +159,16 @@ class CausalA2C(A2C):
             loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + self.causal_vf_coef * causal_value_loss
 
             self.policy.optimizer.zero_grad()
+            self.policy.causal_optimizer.zero_grad()
             loss.backward()
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # Clip and step each param group with its own optimizer so the causal critic's
+            # large gradients do not consume the policy's grad-norm clip budget.
+            grad_norm = th.nn.utils.clip_grad_norm_(self.policy.base_parameters, self.max_grad_norm)
+            # grad_norm.shape == ()  -- base (policy + standard critic) 2-norm, pre-clip
+            causal_grad_norm = th.nn.utils.clip_grad_norm_(self.policy.causal_parameters, self.causal_max_grad_norm)
+            # causal_grad_norm.shape == ()  -- causal critic 2-norm, pre-clip
             self.policy.optimizer.step()
+            self.policy.causal_optimizer.step()
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
         causal_explained_var = explained_variance(self.rollout_buffer.causal_values.flatten(), self.rollout_buffer.causal_returns.flatten())
@@ -161,6 +184,15 @@ class CausalA2C(A2C):
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
+        self.logger.record("diagnostics/advantages_variance", advantages.var().item())
+        self.logger.record("diagnostics/logpolicy_variance", log_prob.var().item())
+        self.logger.record("diagnostics/Alogpolicy_variance", (advantages * log_prob).var().item())
+        self.logger.record("diagnostics/grad_variance", grad_variance)
+        self.logger.record("diagnostics/grad_variance_per_sample", grad_variance / batch_size)
+
+        self.logger.record("diagnostics/grad_norm", grad_norm.item())
+        self.logger.record("diagnostics/causal_grad_norm", causal_grad_norm.item())
+
         perplexity = th.exp(entropy) if entropy is not None else th.exp(-log_prob)
         # perplexity.shape == (batch,)
         self.logger.record("diagnostics/perplexity", perplexity.mean().item())
@@ -168,3 +200,27 @@ class CausalA2C(A2C):
         self.logger.record("diagnostics/return_mean", rollout_data.returns.mean().item())
         self.logger.record("diagnostics/causal_value_mean", causal_values.mean().item())
         self.logger.record("diagnostics/causal_return_mean", rollout_data.causal_returns.mean().item())
+
+        # EV diagnostics (primary): EV = 1 - residual_var / return_var.
+        # Both tiny -> EV near 0 is a numerical artifact, critic is fine.
+        # Both large and similar -> critic is no better than predicting the mean.
+        self.logger.record("diagnostics/return_var", rollout_data.returns.var().item())
+        self.logger.record("diagnostics/residual_var", (rollout_data.returns - values).var().item())
+        self.logger.record("diagnostics/causal_return_var", rollout_data.causal_returns.var().item())
+        self.logger.record("diagnostics/causal_residual_var", (rollout_data.causal_returns - causal_values).var().item())
+        # EV diagnostics (secondary): distinguishes "constant predictor" (value_var ~ 0)
+        # from "varied predictions uncorrelated with truth" (value_var large, residual ~ return_var).
+        self.logger.record("diagnostics/value_var", values.var().item())
+        self.logger.record("diagnostics/causal_value_var", causal_values.var().item())
+
+        correlation = pearsonr(
+            values.detach().cpu().numpy().flatten(),
+            rollout_data.returns.detach().cpu().numpy().flatten(),
+        ).statistic
+        self.logger.record("diagnostics/value_corr", correlation)
+
+        correlation = pearsonr(
+            causal_values.detach().cpu().numpy().flatten(),
+            rollout_data.causal_returns.detach().cpu().numpy().flatten(),
+        ).statistic
+        self.logger.record("diagnostics/causal_value_corr", correlation)

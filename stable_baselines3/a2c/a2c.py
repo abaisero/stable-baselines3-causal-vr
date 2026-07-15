@@ -2,9 +2,11 @@ from typing import Any, ClassVar, TypeVar
 
 import torch as th
 from gymnasium import spaces
+from scipy.stats import pearsonr
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.grad_diagnostics import policy_gradient_variance
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -158,6 +160,10 @@ class A2C(OnPolicyAlgorithm):
             # Policy gradient loss
             policy_loss = -(advantages * log_prob).mean()
 
+            # Variance of the per-sample policy gradients, measured at the pre-step parameters.
+            grad_variance = policy_gradient_variance(self.policy, rollout_data.observations, actions, advantages)
+            batch_size = advantages.shape[0]
+
             # Value loss using the TD(gae_lambda) target
             value_loss = F.mse_loss(rollout_data.returns, values)
 
@@ -175,7 +181,8 @@ class A2C(OnPolicyAlgorithm):
             loss.backward()
 
             # Clip grad norm
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            grad_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            # grad_norm.shape == ()  -- total 2-norm over all params, pre-clip
             self.policy.optimizer.step()
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
@@ -189,11 +196,33 @@ class A2C(OnPolicyAlgorithm):
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
+        self.logger.record("diagnostics/grad_norm", grad_norm.item())
+
+        self.logger.record("diagnostics/advantages_variance", advantages.var().item())
+        self.logger.record("diagnostics/logpolicy_variance", log_prob.var().item())
+        self.logger.record("diagnostics/Alogpolicy_variance", (advantages * log_prob).var().item())
+        self.logger.record("diagnostics/grad_variance", grad_variance)
+        self.logger.record("diagnostics/grad_variance_per_sample", grad_variance / batch_size)
+
         perplexity = th.exp(entropy) if entropy is not None else th.exp(-log_prob)
         # perplexity.shape == (batch,)
         self.logger.record("diagnostics/perplexity", perplexity.mean().item())
         self.logger.record("diagnostics/value_mean", values.mean().item())
         self.logger.record("diagnostics/return_mean", rollout_data.returns.mean().item())
+        # EV diagnostics (primary): EV = 1 - residual_var / return_var.
+        # Both tiny -> EV near 0 is a numerical artifact, critic is fine.
+        # Both large and similar -> critic is no better than predicting the mean.
+        self.logger.record("diagnostics/return_var", rollout_data.returns.var().item())
+        self.logger.record("diagnostics/residual_var", (rollout_data.returns - values).var().item())
+        # EV diagnostics (secondary): distinguishes "constant predictor" (value_var ~ 0)
+        # from "varied predictions uncorrelated with truth" (value_var large, residual ~ return_var).
+        self.logger.record("diagnostics/value_var", values.var().item())
+
+        correlation = pearsonr(
+            values.detach().cpu().numpy().flatten(),
+            rollout_data.returns.detach().cpu().numpy().flatten(),
+        ).statistic
+        self.logger.record("diagnostics/value_corr", correlation)
 
     def learn(
         self: SelfA2C,

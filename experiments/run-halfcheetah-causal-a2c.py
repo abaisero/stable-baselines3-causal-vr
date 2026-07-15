@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("experiment", type=str)
     parser.add_argument("seed", type=int)
+    parser.add_argument("--hp-suffix", type=str, default=None)
     parser.add_argument("--ent-coef", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -41,8 +42,9 @@ def main():
     experiment = args.experiment
     seed = args.seed
 
-    hp_str = f"ec{args.ent_coef}"
-    wandb_group = f"{env}:{algo}:{experiment}:{hp_str}"
+    wandb_group = f"{env}:{algo}:{experiment}"
+    if args.hp_suffix is not None:
+        wandb_group += f":{args.hp_suffix}"
     wandb_name = f"{wandb_group}:s{seed}"
     wandb_tags = [f"env={env}", f"algo={algo}", f"sweep={experiment}"]
     wandb_mode = "disabled" if args.dry_run else "online"
@@ -80,6 +82,7 @@ def main():
             tensorboard_log=f"runs/{run.id}",
             policy_kwargs={"mask_manager": mask_manager},
         )
+        run.config.update(model.policy.param_counts())
 
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS,

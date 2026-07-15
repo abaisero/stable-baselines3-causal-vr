@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 from launchlib import submit
 
 submit(

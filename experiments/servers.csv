@@ -1,0 +1,3 @@
+REMOTE,REMOTE-HOST,REMOTE-PATH
+ava,uci-ava,/home/abaisero/experiments/stable-baselines3-causal-vr/
+spacebug,uci-spacebug,/home/abaisero/experiments/stable-baselines3-causal-vr/

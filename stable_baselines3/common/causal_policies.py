@@ -1,11 +1,10 @@
 import torch as th
 from torch import nn
 
-from stable_baselines3.common.causal_encoders import MeanFutureModel
-from stable_baselines3.common.causal_encoders import EncoderDecoderFutureModel
+from stable_baselines3.common.causal_encoders import EncoderDecoderFutureModel, MLPFutureModel
 from stable_baselines3.common.causal_utils import CausalMaskManager
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import create_mlp
+from stable_baselines3.common.type_aliases import Schedule
 
 
 class CausalActorCriticPolicy(ActorCriticPolicy):
@@ -31,12 +30,42 @@ class CausalActorCriticPolicy(ActorCriticPolicy):
 
     def _build_causal_critic(self) -> None:
         O = self.observation_space.shape[0]  # type: ignore[index]
-        F = 64
-        # TODO: this is a placeholder architecture. Replace with the intended design
-        #       (e.g. sequential model over future observations) once the pipeline is validated.
-        self.future_encoder = EncoderDecoderFutureModel(self.mask_manager, obs_dim=O, output_dim=F)
-        modules = create_mlp(input_dim=O + F, output_dim=1, net_arch=[64, 64])
-        self.causal_value_net = nn.Sequential(*modules)
+        F = 16
+        H = 20  # hardcoded for now
+        # self.future_encoder = EncoderDecoderFutureModel(self.mask_manager, obs_dim=O, output_dim=F)
+        self.future_encoder = MLPFutureModel(self.mask_manager, obs_dim=O, output_dim=F, horizon=H, net_arch=[64, 64])
+        self.causal_value_net = nn.Linear(O + F, 1)
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        super()._build(lr_schedule)
+        # super() built self.optimizer over ALL params (including the causal critic). Split the causal
+        # critic onto its own optimizer so its large/unstable gradients do not share the policy's
+        # grad-norm clip budget. Same learning rate.
+        #
+        # Grab each side directly from its own modules, then assert the two are disjoint and together
+        # cover every parameter -- this catches accidental weight sharing and any base module we forgot.
+        # (pi_features_extractor is always the same object as features_extractor; log_std exists only
+        # for continuous action spaces. Dedup by id since the feature extractor may be shared pi/vf.)
+        self.causal_parameters = list(self.future_encoder.parameters()) + list(self.causal_value_net.parameters())
+
+        base_modules = [
+            self.features_extractor,
+            self.vf_features_extractor,
+            self.mlp_extractor,
+            self.action_net,
+            self.value_net,
+        ]
+        base_params = {id(p): p for m in base_modules for p in m.parameters()}
+        if hasattr(self, "log_std"):
+            base_params[id(self.log_std)] = self.log_std
+        self.base_parameters = list(base_params.values())
+
+        causal_ids = set(map(id, self.causal_parameters))
+        base_ids = set(base_params)
+        assert causal_ids.isdisjoint(base_ids), "causal critic shares parameters with the policy/standard critic"
+        assert base_ids | causal_ids == set(map(id, self.parameters())), "param split does not cover all parameters"
+        self.optimizer = self.optimizer_class(self.base_parameters, lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
+        self.causal_optimizer = self.optimizer_class(self.causal_parameters, lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
 
     def predict_causal_values(
         self,
@@ -57,3 +86,15 @@ class CausalActorCriticPolicy(ActorCriticPolicy):
         values = self.causal_value_net(x)
         # values.shape == (B, 1)
         return values
+
+    def param_counts(self) -> dict[str, int]:
+        """Parameter counts per component: actor, standard critic, causal critic."""
+
+        def count(*mods: nn.Module) -> int:
+            return sum(p.numel() for m in mods for p in m.parameters())
+
+        return {
+            "n_params_actor": count(self.mlp_extractor.policy_net, self.action_net),
+            "n_params_critic": count(self.mlp_extractor.value_net, self.value_net),
+            "n_params_causal": sum(p.numel() for p in self.causal_parameters),
+        }

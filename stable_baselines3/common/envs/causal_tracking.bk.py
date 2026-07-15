@@ -7,27 +7,20 @@ from stable_baselines3.common.causal_env import CausalEnv
 # Toy tracking environment that cleanly illustrates the causal RL setting:
 #
 #   x — controllable: action directly causes x' (action-descendant)
-#   y — uncontrollable: random walk target, independent of action
-#   z — uncontrollable: random walk that enters the reward ADDITIVELY, independent
-#       of action.  Pure exogenous reward noise, decoupled from the tracking signal.
+#   y — uncontrollable: pure random walk, independent of action
 #
-# Task: control x to track y.  Reward penalizes the gap |x - y| and adds z.
+# Task: control x to track y.  Reward penalizes the gap |x - y|.
 #
-# Why z exists (the key design point):
-#   In the pure tracking reward -|x - y|, raising sigma_y to make A2C struggle also
-#   shrinks the action's marginal effect on the reward (the gradient of E|mu - y - noise|
-#   flattens as the noise grows), so signal and noise are COUPLED — A2C still converges
-#   to the same optimum, just slower.  z decouples them: it is large additive exogenous
-#   reward noise (sigma_z >> action effect) that does NOT change which policy is optimal.
-#   A standard critic cannot predict the realized future z, so A2C's advantage is swamped
-#   and it fails to learn the tracking signal.  A causal critic conditions on z's observed
-#   future and cancels it exactly, recovering full-strength tracking signal.  The result is
-#   a persistent return gap, not merely faster convergence.
+# Why this is maximally illustrative:
+#   y's future trajectory is entirely independent of the action, so knowing
+#   it in advance perfectly predicts the baseline return.  A causal critic
+#   that conditions on y's future collapses all reward variance due to y's
+#   random walk.  A standard critic cannot do this because it cannot
+#   distinguish causal from non-causal variance sources.
 #
-# Observation (3 dims):
+# Observation (2 dims):
 #   0: x — position of controllable variable
-#   1: y — position of uncontrollable tracking target
-#   2: z — uncontrollable additive reward-noise variable
+#   1: y — position of uncontrollable target variable
 #
 # Action (discrete, len(ACTIONS) choices):
 #   0: move x left  (-1.0)
@@ -37,17 +30,16 @@ from stable_baselines3.common.causal_env import CausalEnv
 # Dynamics:
 #   x' = x + ACTIONS[a] + noise_x,   noise_x ~ N(0, sigma_x)
 #   y' = y              + noise_y,   noise_y ~ N(0, sigma_y)
-#   z' = z              + noise_z,   noise_z ~ N(0, sigma_z)
 #
 # Reward (depends on `reward_type`):
-#   "state-action": r = -|x_post_action - y| + z     [function of (s, a) only]
-#   "transition":   r = -|x' - y'| + z'              [function of (s, a, s'); noise leaks in]
+#   "state-action": r = -|x_post_action - y|   [function of (s, a) only]
+#   "transition":   r = -|x' - y'|             [function of (s, a, s'); noise leaks in]
 #
 # Causal structure:
-#   adjacency_as:  action -> x only  (action does not affect y or z)
-#   adjacency_ss:  x -> x, y -> y, z -> z   (independent random walks, no cross-causation)
+#   adjacency_as:  action -> x only  (action does not affect y)
+#   adjacency_ss:  x -> x, y -> y   (independent random walks, no cross-causation)
 
-N_OBS = 3
+N_OBS = 2
 
 # Maps discrete action index to displacement applied to x
 ACTIONS = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
@@ -57,19 +49,14 @@ class CausalTrackingEnv(CausalEnv):
     """
     Minimal tracking environment for causal RL.
 
-    x (controllable) must track y (uncontrollable random walk), while z is large
-    additive exogenous reward noise.  The causal critic can condition on the futures
-    of y and z to collapse reward variance from their random walks — variance the
-    standard critic cannot eliminate.  z in particular is decoupled from the action's
-    effect, so it can be scaled up to break A2C without making the optimal policy
-    indistinguishable from a random one.
+    x (controllable) must track y (uncontrollable random walk).
+    The causal critic can condition on y's future to collapse reward variance
+    from y's random walk — variance the standard critic cannot eliminate.
 
     Episode termination is handled externally via TimeLimit wrapper.
 
     :param sigma_x: std of process noise for x
-    :param sigma_y: std of process noise for y (tracking-target random walk)
-    :param sigma_z: std of process noise for z (additive exogenous reward noise;
-        scale this up to drown A2C's policy-gradient signal)
+    :param sigma_y: std of process noise for y (drives the tracking difficulty)
     :param reward_type: "state-action" for R(s, a) — reward computed before noise.
         "transition" for R(s, a, s') — reward computed after noise (next-state-dependent).
     """
@@ -80,7 +67,6 @@ class CausalTrackingEnv(CausalEnv):
         self,
         sigma_x: float = 0.1,
         sigma_y: float = 1.0,
-        sigma_z: float = 10.0,
         *,
         reward_type: str = "transition",
     ):
@@ -89,7 +75,6 @@ class CausalTrackingEnv(CausalEnv):
 
         self.sigma_x = sigma_x
         self.sigma_y = sigma_y
-        self.sigma_z = sigma_z
         self.reward_type = reward_type
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(N_OBS,), dtype=np.float32)
@@ -104,21 +89,21 @@ class CausalTrackingEnv(CausalEnv):
         return self._state.copy(), {}
 
     def step(self, action: int):
-        action_state = np.array([ACTIONS[action], 0.0, 0.0], dtype=np.float32)
+        action_state = np.array([ACTIONS[action], 0.0], dtype=np.float32)
         # action_state.shape == (N_OBS,)
         self._state = self._state + action_state
         # self._state.shape == (N_OBS,)
 
         if self.reward_type == "state-action":
-            reward = float(-abs(self._state[0] - self._state[1]) + self._state[2])
+            reward = float(-abs(self._state[0] - self._state[1]))
 
-        noise = self.np_random.normal([0.0, 0.0, 0.0], [self.sigma_x, self.sigma_y, self.sigma_z]).astype(np.float32)
+        noise = self.np_random.normal([0.0, 0.0], [self.sigma_x, self.sigma_y]).astype(np.float32)
         # noise.shape == (N_OBS,)
         self._state = self._state + noise
         # self._state.shape == (N_OBS,)
 
         if self.reward_type == "transition":
-            reward = float(-abs(self._state[0] - self._state[1]) + self._state[2])
+            reward = float(-abs(self._state[0] - self._state[1]))
 
         return self._state.copy(), reward, False, False, {}
 
@@ -127,12 +112,12 @@ class CausalTrackingEnv(CausalEnv):
         Binary adjacency matrix of shape (1, N_OBS).
         adjacency_as[0, j] = 1 if the action directly causes next-state feature j.
 
-        The action (discrete displacement) causes x (index 0) but not y or z.
+        The action (discrete displacement) causes x (index 0) but not y (index 1).
         """
         return np.array(
             [
-                #  x  y  z
-                [1, 0, 0],  # displacement -> x only
+                #  x  y
+                [1, 0],  # displacement -> x only
             ],
             dtype=np.int8,
         )
@@ -142,14 +127,13 @@ class CausalTrackingEnv(CausalEnv):
         Binary adjacency matrix of shape (N_OBS, N_OBS).
         adjacency_ss[i, j] = 1 if state feature i directly causes next-state feature j.
 
-        x, y, z are independent random walks with no cross-causation.
+        x and y are independent random walks with no cross-causation.
         """
         return np.array(
             [
-                #  x  y  z
-                [1, 0, 0],  # x -> x'
-                [0, 1, 0],  # y -> y'
-                [0, 0, 1],  # z -> z'
+                #  x  y
+                [1, 0],  # x -> x'
+                [0, 1],  # y -> y'
             ],
             dtype=np.int8,
         )

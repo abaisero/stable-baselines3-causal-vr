@@ -1,5 +1,6 @@
 import argparse
 
+import numpy as np
 import wandb
 from wandb.integration.sb3 import WandbCallback
 
@@ -10,11 +11,15 @@ from stable_baselines3.common.causal_policies import CausalActorCriticPolicy
 from stable_baselines3.common.causal_utils import CausalMaskManager
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.envs.causal_tracking import CausalTrackingEnv
+from stable_baselines3.common.vec_env import VecNormalize
 
 N_ENVS = 4
 N_STEPS = 128
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = 2_000_000
 MAX_EPISODE_STEPS = 100
+
+GAMMA = 0.5
+SIGMA_Z = 2.0
 
 VERBOSE = 1
 
@@ -23,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("experiment", type=str)
     parser.add_argument("seed", type=int)
+    parser.add_argument("--hp-suffix", type=str, default=None)
     parser.add_argument("--ent-coef", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -43,8 +49,9 @@ def main():
     experiment = args.experiment
     seed = args.seed
 
-    hp_str = f"ec{args.ent_coef}"
-    wandb_group = f"{env}:{algo}:{experiment}:{hp_str}"
+    wandb_group = f"{env}:{algo}:{experiment}"
+    if args.hp_suffix is not None:
+        wandb_group += f":{args.hp_suffix}"
     wandb_name = f"{wandb_group}:s{seed}"
     wandb_tags = [f"env={env}", f"algo={algo}", f"sweep={experiment}"]
     wandb_mode = "disabled" if args.dry_run else "online"
@@ -73,20 +80,28 @@ def main():
         venv = make_vec_env(
             env,
             n_envs=N_ENVS,
-            env_kwargs={"max_episode_steps": MAX_EPISODE_STEPS},
+            env_kwargs={"max_episode_steps": MAX_EPISODE_STEPS, "sigma_z": SIGMA_Z},
         )
+        # Tracking obs (x, y) are an unbounded random walk; normalize observations so the
+        # critics (especially the causal critic, which sees y's full future window) get
+        # stable-scale inputs. Reward is left unnormalized to keep return/EV diagnostics
+        # directly comparable across runs.
+        # clip_obs=inf: clipping would alias large y excursions (partial observability).
+        # venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=np.inf)
         mask_manager = make_mask_manager(CausalTrackingEnv)
 
         model = CausalA2C(
             CausalActorCriticPolicy,
             venv,
             n_steps=N_STEPS,
+            gamma=GAMMA,
             ent_coef=args.ent_coef,
             verbose=VERBOSE,
             seed=seed,
             tensorboard_log=f"runs/{run.id}",
             policy_kwargs={"mask_manager": mask_manager},
         )
+        run.config.update(model.policy.param_counts())
 
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS,
